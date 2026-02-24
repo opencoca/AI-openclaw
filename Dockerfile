@@ -1,6 +1,6 @@
 FROM node:22-bookworm@sha256:cd7bcd2e7a1e6f72052feb023c7f6b722205d3fcab7bbcbd2d1bfdab10b1e935
 
-# Install Bun (required for build scripts)
+# Bun + base stuff (as root)
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:${PATH}"
 
@@ -9,6 +9,21 @@ RUN corepack enable
 WORKDIR /app
 RUN chown node:node /app
 
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      curl \
+      file \
+      git \
+      ca-certificates \
+      locales && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen && locale-gen
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+
+# optional APT packages...
 ARG OPENCLAW_DOCKER_APT_PACKAGES=""
 RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
       apt-get update && \
@@ -16,6 +31,31 @@ RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
       apt-get clean && \
       rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
     fi
+
+# ---- Homebrew setup (as root) ----
+RUN useradd -m -s /bin/bash linuxbrew && \
+    mkdir -p /home/linuxbrew/.linuxbrew && \
+    chown -R linuxbrew:linuxbrew /home/linuxbrew
+
+# Install Homebrew as linuxbrew
+USER linuxbrew
+WORKDIR /home/linuxbrew
+ENV NONINTERACTIVE=1
+RUN /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# Export Brew for all later layers
+ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
+
+# Optionally install brew packages here
+# RUN brew install ...
+
+# ---- back to Node for app deps ----
+USER root
+
+# Give the node user ownership of Homebrew so it can `brew install` at runtime
+RUN chown -R node:node /home/linuxbrew/.linuxbrew
+
+WORKDIR /app
 
 COPY --chown=node:node package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY --chown=node:node ui/package.json ./ui/package.json
@@ -30,7 +70,7 @@ RUN pnpm install --frozen-lockfile
 # Adds ~300MB but eliminates the 60-90s Playwright install on every container start.
 # Must run after pnpm install so playwright-core is available in node_modules.
 USER root
-ARG OPENCLAW_INSTALL_BROWSER=""
+ARG OPENCLAW_INSTALL_BROWSER="1"
 RUN if [ -n "$OPENCLAW_INSTALL_BROWSER" ]; then \
       apt-get update && \
       DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb && \
@@ -51,6 +91,15 @@ RUN pnpm ui:build
 
 ENV NODE_ENV=production
 
+USER root
+RUN mkdir -p /usr/local/lib/node_modules && chown -R node:node /usr/local/lib/node_modules /usr/local/bin
+USER node
+
+# Create the `openclaw` symlink on the PATH so the binary is callable by name
+ENV PNPM_HOME="/home/node/.local/share/pnpm"
+ENV PATH="${PNPM_HOME}:${PATH}"
+RUN pnpm link --global
+
 # Security hardening: Run as non-root user
 # The node:22-bookworm image includes a 'node' user (uid 1000)
 # This reduces the attack surface by preventing container escape via root privileges
@@ -61,5 +110,5 @@ USER node
 #
 # For container platforms requiring external health checks:
 #   1. Set OPENCLAW_GATEWAY_TOKEN or OPENCLAW_GATEWAY_PASSWORD env var
-#   2. Override CMD: ["node","openclaw.mjs","gateway","--allow-unconfigured","--bind","lan"]
-CMD ["node", "openclaw.mjs", "gateway", "--allow-unconfigured"]
+#   2. Override CMD: ["openclaw","gateway","--allow-unconfigured","--bind","lan"]
+CMD ["openclaw", "gateway", "--allow-unconfigured"]
